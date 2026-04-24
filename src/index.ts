@@ -7,7 +7,7 @@ import {
   ListToolsRequestSchema,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
-import { chromium } from 'playwright';
+import { chromium, type Page, type Locator } from 'playwright';
 import { z } from 'zod';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -44,6 +44,26 @@ interface ImageInfo {
   placeholder: string;
 }
 
+// 本文画像挿入のコンテキスト/結果型 (2026-04-25 多戦略対応のため追加)
+interface InsertImageContext {
+  page: Page;
+  bodyBox: Locator;
+  imagePath: string;
+  imageIndex: number;       // 1-based, ログ用
+  totalImages: number;
+  screenshotDir: string;
+  isMac: boolean;
+  pasteKey: string;
+}
+
+interface InsertImageResult {
+  success: boolean;
+  strategy: 'inputFiles' | 'drop' | 'clipboard' | 'failed';
+  imgCountBefore: number;
+  imgCountAfter: number;
+  errorMessage?: string;
+}
+
 // Markdownから画像パスを抽出する関数
 function extractImages(markdown: string, baseDir: string): ImageInfo[] {
   const imageRegex = /!\[([^\]]*)\]\(([^)]+)\)/g;
@@ -71,6 +91,66 @@ function extractImages(markdown: string, baseDir: string): ImageInfo[] {
   }
 
   return images;
+}
+
+// ─────────────────────────────────────────────────────────
+// 本文画像挿入用ヘルパー (2026-04-25 多戦略対応)
+// ─────────────────────────────────────────────────────────
+
+// 本文 contenteditable 内の <img> 要素数を取得
+async function countImages(bodyBox: Locator): Promise<number> {
+  try {
+    return await bodyBox.evaluate((el) => el.querySelectorAll('img').length);
+  } catch {
+    return 0;
+  }
+}
+
+// デバッグ用 screenshot
+async function debugSnapshot(
+  page: Page,
+  screenshotDir: string,
+  label: string
+): Promise<void> {
+  try {
+    const filePath = path.join(screenshotDir, `debug-${label}-${nowStr()}.png`);
+    await page.screenshot({ path: filePath, fullPage: false });
+    log(`debug screenshot: ${filePath}`);
+  } catch (e: any) {
+    log('debug screenshot failed', e?.message);
+  }
+}
+
+// note エディタの hidden file input を探索 (image accept 優先)
+async function findHiddenImageInput(page: Page): Promise<Locator | null> {
+  const candidates = [
+    'input[type="file"][accept*="image"]',
+    'input[type="file"][name*="image"]',
+    // フォールバック: 画像専用 input が見つからない場合
+    // 注意: サムネ用 input (accept "image/*") と同居している場合あり、
+    // accept パターンで絞り込んだ後の最終手段
+  ];
+  for (const sel of candidates) {
+    const loc = page.locator(sel);
+    const count = await loc.count();
+    if (count > 0) return loc.first();
+  }
+  return null;
+}
+
+// 画像挿入後 bodyBox 内の <img> 数が増えるまで待機
+async function waitForImageAdded(
+  bodyBox: Locator,
+  before: number,
+  timeoutMs = 8000
+): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const now = await countImages(bodyBox);
+    if (now > before) return true;
+    await new Promise(r => setTimeout(r, 200));
+  }
+  return false;
 }
 
 // Markdownファイルをパースする関数
@@ -137,6 +217,504 @@ function parseMarkdown(content: string): {
   };
 }
 
+// ─────────────────────────────────────────────────────────
+// 本文画像挿入の 3 戦略 (2026-04-25 多戦略対応)
+// 戦略: 1. setInputFiles → 2. drop event → 3. clipboard paste
+// ─────────────────────────────────────────────────────────
+
+// 戦略 1: hidden file input 経由のアップロード
+async function insertImageViaInputFiles(
+  page: Page,
+  imagePath: string
+): Promise<boolean> {
+  const hiddenInput = await findHiddenImageInput(page);
+  if (!hiddenInput) {
+    log('  inputFiles: no hidden input found');
+    return false;
+  }
+  log('  inputFiles: hidden input found, setInputFiles', { imagePath });
+  await hiddenInput.setInputFiles(imagePath);
+  return true;
+}
+
+// 戦略 2: DragEvent injection
+async function insertImageViaDrop(
+  bodyBox: Locator,
+  imagePath: string
+): Promise<boolean> {
+  const buffer = fs.readFileSync(imagePath);
+  const base64 = buffer.toString('base64');
+  const ext = path.extname(imagePath).toLowerCase().replace('.', '');
+  const mimeType =
+    ext === 'png' ? 'image/png' :
+    (ext === 'jpg' || ext === 'jpeg') ? 'image/jpeg' :
+    ext === 'gif' ? 'image/gif' :
+    ext === 'webp' ? 'image/webp' : 'image/png';
+  const fileName = path.basename(imagePath);
+
+  const box = await bodyBox.boundingBox();
+  if (!box) {
+    log('  drop: bodyBox boundingBox null');
+    return false;
+  }
+  const x = box.x + box.width / 2;
+  const y = box.y + box.height / 2;
+
+  return await bodyBox.evaluate(
+    (el, args) => {
+      try {
+        const { base64, mime, fileName, x, y } = args as any;
+        const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+        const file = new File([bytes], fileName, { type: mime });
+        const dt = new DataTransfer();
+        dt.items.add(file);
+
+        const init: any = {
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+          clientX: x,
+          clientY: y,
+          dataTransfer: dt,
+        };
+        el.dispatchEvent(new DragEvent('dragenter', init));
+        el.dispatchEvent(new DragEvent('dragover', init));
+        el.dispatchEvent(new DragEvent('drop', init));
+        return true;
+      } catch (e) {
+        console.error('drop dispatch failed', e);
+        return false;
+      }
+    },
+    { base64, mime: mimeType, fileName, x, y }
+  );
+}
+
+// 戦略 3: clipboard paste (既存ロジックの関数化 + エラー伝播)
+async function insertImageViaClipboard(ctx: InsertImageContext): Promise<boolean> {
+  const { page, imagePath, pasteKey } = ctx;
+  const imageBuffer = fs.readFileSync(imagePath);
+  const base64Image = imageBuffer.toString('base64');
+  const ext = path.extname(imagePath).toLowerCase();
+  const mimeType =
+    ext === '.png' ? 'image/png' :
+    (ext === '.jpg' || ext === '.jpeg') ? 'image/jpeg' :
+    ext === '.gif' ? 'image/gif' : 'image/png';
+
+  const writeResult = await page.evaluate(async ({ base64, mime }) => {
+    try {
+      const response = await fetch(`data:${mime};base64,${base64}`);
+      const blob = await response.blob();
+      const item = new ClipboardItem({ [mime]: blob });
+      await navigator.clipboard.write([item]);
+      return { ok: true, blobSize: blob.size };
+    } catch (e: any) {
+      return { ok: false, error: String(e?.message ?? e) };
+    }
+  }, { base64: base64Image, mime: mimeType });
+
+  log('  clipboard.write result:', writeResult);
+  if (!writeResult.ok) return false;
+
+  await page.waitForTimeout(500);
+  await page.keyboard.press(pasteKey);
+  await page.waitForTimeout(2000);
+  return true;
+}
+
+// メイン: 3 戦略フォールバック
+async function insertInlineImage(ctx: InsertImageContext): Promise<InsertImageResult> {
+  const { page, bodyBox, imagePath, imageIndex, totalImages, screenshotDir } = ctx;
+  const tag = `[image ${imageIndex}/${totalImages}]`;
+  log(`${tag} start`, { imagePath });
+
+  await bodyBox.click().catch(() => {});  // focus 確実化
+  await page.waitForTimeout(100);
+
+  const before = await countImages(bodyBox);
+  log(`${tag} img count before:`, before);
+
+  // 改行で挿入位置を確保
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(300);
+
+  // === 戦略 1: setInputFiles ===
+  try {
+    const ok = await insertImageViaInputFiles(page, imagePath);
+    if (ok) {
+      const success = await waitForImageAdded(bodyBox, before, 8000);
+      if (success) {
+        const after = await countImages(bodyBox);
+        log(`${tag} ✓ inputFiles success`, { before, after });
+        return { success: true, strategy: 'inputFiles', imgCountBefore: before, imgCountAfter: after };
+      }
+      log(`${tag} ✗ inputFiles: img count did not increase`);
+    }
+  } catch (e: any) {
+    log(`${tag} ✗ inputFiles error:`, e?.message);
+  }
+
+  // === 戦略 2: drop event ===
+  try {
+    log(`${tag} → trying drop`);
+    const ok = await insertImageViaDrop(bodyBox, imagePath);
+    if (ok) {
+      const success = await waitForImageAdded(bodyBox, before, 8000);
+      if (success) {
+        const after = await countImages(bodyBox);
+        log(`${tag} ✓ drop success`, { before, after });
+        return { success: true, strategy: 'drop', imgCountBefore: before, imgCountAfter: after };
+      }
+      log(`${tag} ✗ drop: img count did not increase`);
+    }
+  } catch (e: any) {
+    log(`${tag} ✗ drop error:`, e?.message);
+  }
+
+  // === 戦略 3: clipboard paste ===
+  try {
+    log(`${tag} → trying clipboard`);
+    const ok = await insertImageViaClipboard(ctx);
+    if (ok) {
+      const success = await waitForImageAdded(bodyBox, before, 8000);
+      if (success) {
+        const after = await countImages(bodyBox);
+        log(`${tag} ✓ clipboard success`, { before, after });
+        return { success: true, strategy: 'clipboard', imgCountBefore: before, imgCountAfter: after };
+      }
+      log(`${tag} ✗ clipboard: img count did not increase`);
+    }
+  } catch (e: any) {
+    log(`${tag} ✗ clipboard error:`, e?.message);
+  }
+
+  await debugSnapshot(page, screenshotDir, `img${imageIndex}-all-failed`);
+  return {
+    success: false,
+    strategy: 'failed',
+    imgCountBefore: before,
+    imgCountAfter: before,
+    errorMessage: 'All 3 strategies (inputFiles, drop, clipboard) failed',
+  };
+}
+
+// note.com アクセス解析取得関数
+interface NoteArticleStat {
+  title: string;
+  key: string;
+  pv: number;
+  likes: number;
+  comments: number;
+  url: string;
+}
+
+interface AnalyticsResult {
+  success: boolean;
+  period: { start: string; end: string };
+  filter: string;
+  articles: NoteArticleStat[];
+  totalPV: number;
+  totalLikes: number;
+  totalComments: number;
+  articleCount: number;
+  fetchedAt: string;
+  message: string;
+}
+
+async function getAnalytics(params: {
+  statePath?: string;
+  filter?: string;
+  sort?: string;
+  limit?: number;
+  timeout?: number;
+}): Promise<AnalyticsResult> {
+  const {
+    statePath = DEFAULT_STATE_PATH,
+    filter = 'monthly',
+    sort = 'pv',
+    limit = 10,
+    timeout = DEFAULT_TIMEOUT,
+  } = params;
+
+  // 認証状態ファイルを確認
+  if (!fs.existsSync(statePath)) {
+    throw new Error(`State file not found: ${statePath}. Please login first with: npm run login`);
+  }
+
+  const validFilters = ['all', 'monthly', 'weekly', 'yearly'];
+  if (!validFilters.includes(filter)) {
+    throw new Error(`Invalid filter: ${filter}. Must be one of: ${validFilters.join(', ')}`);
+  }
+
+  const validSorts = ['pv', 'like', 'comment'];
+  if (!validSorts.includes(sort)) {
+    throw new Error(`Invalid sort: ${sort}. Must be one of: ${validSorts.join(', ')}`);
+  }
+
+  log('Fetching analytics', { filter, sort, limit });
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--lang=ja-JP'],
+  });
+
+  try {
+    const context = await browser.newContext({
+      storageState: statePath,
+      locale: 'ja-JP',
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    });
+    const page = await context.newPage();
+    page.setDefaultTimeout(timeout);
+
+    // ダッシュボードに遷移（Cookie認証を確立するため）
+    await page.goto('https://note.com/sitesettings/stats', { waitUntil: 'domcontentloaded', timeout });
+
+    // ログイン確認
+    const currentUrl = page.url();
+    if (currentUrl.includes('/login')) {
+      await context.close();
+      await browser.close();
+      throw new Error('Session expired. Please re-login with: npm run login');
+    }
+
+    // 内部APIを fetch で全件取得（ページのCookieを使用）
+    const allArticles: NoteArticleStat[] = [];
+    let pageNum = 1;
+    const maxPages = 10; // 安全上限
+    let periodStart = '';
+    let periodEnd = '';
+
+    while (pageNum <= maxPages) {
+      const apiUrl = `/api/v1/stats/pv?filter=${filter}&page=${pageNum}&sort=pv`;
+      const apiResult = await page.evaluate(async (url: string) => {
+        const res = await fetch(url);
+        if (!res.ok) {
+          return { error: `API returned ${res.status}`, data: null };
+        }
+        const json = await res.json();
+        return { error: null, data: json.data };
+      }, apiUrl);
+
+      if (apiResult.error || !apiResult.data) {
+        throw new Error(apiResult.error || 'Failed to fetch analytics data');
+      }
+
+      const { note_stats, start_date_str, end_date_str, last_page } = apiResult.data;
+
+      if (pageNum === 1) {
+        periodStart = start_date_str;
+        periodEnd = end_date_str;
+      }
+
+      if (pageNum === 1 && note_stats.length === 0) {
+        await context.close();
+        await browser.close();
+        return {
+          success: true,
+          period: { start: periodStart, end: periodEnd },
+          filter,
+          articles: [],
+          totalPV: 0,
+          totalLikes: 0,
+          totalComments: 0,
+          articleCount: 0,
+          fetchedAt: new Date().toISOString(),
+          message: 'No articles found for the selected period',
+        };
+      }
+
+      for (const stat of note_stats) {
+        allArticles.push({
+          title: stat.name,
+          key: stat.key,
+          pv: stat.read_count,
+          likes: stat.like_count,
+          comments: stat.comment_count,
+          url: `https://note.com/${stat.user?.urlname || '01start'}/n/${stat.key}`,
+        });
+      }
+
+      if (last_page) break;
+      pageNum++;
+    }
+
+    // クライアント側でソート（API のソートはページ単位のため）
+    const sortKey = sort === 'like' ? 'likes' : sort === 'comment' ? 'comments' : 'pv';
+    allArticles.sort((a, b) => (b as any)[sortKey] - (a as any)[sortKey]);
+
+    // 全件の合計を算出してから limit で切り詰め
+    const totalPV = allArticles.reduce((s, a) => s + a.pv, 0);
+    const totalLikes = allArticles.reduce((s, a) => s + a.likes, 0);
+    const totalComments = allArticles.reduce((s, a) => s + a.comments, 0);
+    const limitedArticles = allArticles.slice(0, limit);
+
+    await context.close();
+    await browser.close();
+
+    const result: AnalyticsResult = {
+      success: true,
+      period: { start: periodStart, end: periodEnd },
+      filter,
+      articles: limitedArticles,
+      totalPV,
+      totalLikes,
+      totalComments,
+      articleCount: limitedArticles.length,
+      fetchedAt: new Date().toISOString(),
+      message: `Top ${limitedArticles.length} of ${allArticles.length} articles (${filter}, sorted by ${sort})`,
+    };
+
+    log('Analytics fetched', { articleCount: allArticles.length, totalPV, totalLikes });
+    return result;
+  } catch (error) {
+    await browser.close();
+    throw error;
+  }
+}
+
+// 競合 note クリエイター分析関数
+interface CompetitorArticle {
+  title: string;
+  key: string;
+  likes: number;
+  comments: number;
+  publishedAt: string;
+  url: string;
+  hashtags: string[];
+  bodyPreview: string;
+}
+
+interface CompetitorResult {
+  success: boolean;
+  creator: string;
+  creatorName: string;
+  articles: CompetitorArticle[];
+  totalArticles: number;
+  avgLikes: number;
+  avgComments: number;
+  topHashtags: { tag: string; count: number }[];
+  fetchedAt: string;
+  message: string;
+}
+
+async function analyzeCompetitor(params: {
+  creator: string;
+  limit?: number;
+  timeout?: number;
+}): Promise<CompetitorResult> {
+  const {
+    creator,
+    limit = 20,
+    timeout = 30000,
+  } = params;
+
+  log('Analyzing competitor', { creator, limit });
+
+  const allArticles: CompetitorArticle[] = [];
+  let creatorName = creator;
+  let page = 1;
+  const perPage = 20;
+  const maxPages = Math.ceil(limit / perPage);
+
+  while (page <= maxPages) {
+    const apiUrl = `https://note.com/api/v2/creators/${encodeURIComponent(creator)}/contents?kind=note&page=${page}&per_page=${perPage}`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    try {
+      const res = await fetch(apiUrl, {
+        signal: controller.signal,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+          'Accept': 'application/json',
+        },
+      });
+      clearTimeout(timeoutId);
+
+      if (!res.ok) {
+        if (res.status === 404) {
+          throw new Error(`Creator not found: ${creator}`);
+        }
+        throw new Error(`API returned ${res.status}`);
+      }
+
+      const json = await res.json();
+      const contents = json.data?.contents ?? [];
+
+      if (contents.length === 0) break;
+
+      // クリエイター名を取得（最初のページのみ）
+      if (page === 1 && contents[0]?.user?.nickname) {
+        creatorName = contents[0].user.nickname;
+      }
+
+      for (const item of contents) {
+        allArticles.push({
+          title: item.name || 'Untitled',
+          key: item.key || '',
+          likes: item.likeCount || 0,
+          comments: item.commentCount || 0,
+          publishedAt: item.publishAt || '',
+          url: item.noteUrl || `https://note.com/${creator}/n/${item.key}`,
+          hashtags: (item.hashtags || []).map((h: any) => h.hashtag?.name || h.name || String(h)),
+          bodyPreview: (item.body || '').substring(0, 200),
+        });
+      }
+
+      // 最後のページに達したか
+      if (contents.length < perPage) break;
+      page++;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if ((error as Error).name === 'AbortError') {
+        throw new Error(`Timeout fetching creator: ${creator}`);
+      }
+      throw error;
+    }
+  }
+
+  // limit で切り詰め
+  const limited = allArticles.slice(0, limit);
+
+  // 統計計算
+  const avgLikes = limited.length > 0
+    ? Math.round(limited.reduce((s, a) => s + a.likes, 0) / limited.length)
+    : 0;
+  const avgComments = limited.length > 0
+    ? Math.round(limited.reduce((s, a) => s + a.comments, 0) / limited.length)
+    : 0;
+
+  // トップハッシュタグ集計
+  const tagCounts = new Map<string, number>();
+  for (const article of limited) {
+    for (const tag of article.hashtags) {
+      tagCounts.set(tag, (tagCounts.get(tag) || 0) + 1);
+    }
+  }
+  const topHashtags = Array.from(tagCounts.entries())
+    .map(([tag, count]) => ({ tag, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 10);
+
+  const result: CompetitorResult = {
+    success: true,
+    creator,
+    creatorName,
+    articles: limited,
+    totalArticles: limited.length,
+    avgLikes,
+    avgComments,
+    topHashtags,
+    fetchedAt: new Date().toISOString(),
+    message: `Fetched ${limited.length} articles from ${creatorName} (@${creator})`,
+  };
+
+  log('Competitor analysis complete', { creator, articleCount: limited.length, avgLikes });
+  return result;
+}
+
 // note.com投稿関数
 async function postToNote(params: {
   markdownPath: string;
@@ -150,6 +728,7 @@ async function postToNote(params: {
   url: string;
   screenshot?: string;
   message: string;
+  imageStats?: { expected: number; actual: number };
 }> {
   const {
     markdownPath,
@@ -192,6 +771,7 @@ async function postToNote(params: {
       storageState: statePath,
       locale: 'ja-JP',
       permissions: ['clipboard-read', 'clipboard-write'],
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     });
     const page = await context.newPage();
     page.setDefaultTimeout(timeout);
@@ -303,200 +883,127 @@ async function postToNote(params: {
     await page.fill('textarea[placeholder*="タイトル"]', title);
     log('Title set');
 
-    // 本文設定（行ごとに処理してURLをリンクカードに変換、画像を埋め込む）
+    // 本文設定（チャンク分割クリップボード貼り付け方式）
+    // 通常テキストをまとめてクリップボード→Cmd+Vで一括貼り付けし、
+    // 特殊行（URL、画像、コードブロック）のみ個別処理する。
     const bodyBox = page.locator('div[contenteditable="true"][role="textbox"]').first();
     await bodyBox.waitFor({ state: 'visible' });
     await bodyBox.click();
-    
+
     const lines = body.split('\n');
-    let previousLineWasList = false; // 前の行がリスト項目だったかを追跡
-    let previousLineWasQuote = false; // 前の行が引用だったかを追跡
-    let previousLineWasHorizontalRule = false; // 前の行が水平線だったかを追跡
-    
+    const isMac = process.platform === 'darwin';
+    const pasteKey = isMac ? 'Meta+v' : 'Control+v';
+    const CHUNK_SIZE = 50; // 50行ずつまとめて貼り付け
+
+    // ヘルパー: テキストチャンクをクリップボード経由で貼り付け
+    const pasteChunk = async (text: string) => {
+      if (!text) return;
+      await page.evaluate((t) => navigator.clipboard.writeText(t), text);
+      await page.waitForTimeout(100);
+      await page.keyboard.press(pasteKey);
+      await page.waitForTimeout(200);
+    };
+
+    let buffer: string[] = []; // 通常テキスト行のバッファ
+
+    // バッファをフラッシュ（まとめて貼り付け）
+    const flushBuffer = async () => {
+      if (buffer.length === 0) return;
+      const text = buffer.join('\n');
+      await pasteChunk(text);
+      buffer = [];
+    };
+
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       const isLastLine = i === lines.length - 1;
-      
-      // コードブロックの開始を検出
+
+      // コードブロック: まとめてクリップボード貼り付け
       if (line.trim().startsWith('```')) {
-        // コードブロック全体（```から```まで）を収集
-        const codeBlockLines: string[] = [line]; // 開始行を含める
+        await flushBuffer();
+        const codeBlockLines: string[] = [line];
         let j = i + 1;
-        
-        // 終了行まで収集
         while (j < lines.length) {
           codeBlockLines.push(lines[j]);
-          if (lines[j].trim().startsWith('```')) {
-            break; // 終了行を含めて終了
-          }
+          if (lines[j].trim().startsWith('```')) break;
           j++;
         }
-        
-        // コードブロック全体をクリップボードにコピー
-        const codeBlockContent = codeBlockLines.join('\n');
-        
-        await page.evaluate((text) => {
-          return navigator.clipboard.writeText(text);
-        }, codeBlockContent);
-        
-        await page.waitForTimeout(200);
-        
-        // ペースト
-        const isMac = process.platform === 'darwin';
-        if (isMac) {
-          await page.keyboard.press('Meta+v');
-        } else {
-          await page.keyboard.press('Control+v');
-        }
-        
-        await page.waitForTimeout(300);
-        
-        // コードブロックの後に改行（最終行でない場合）
-        if (j < lines.length - 1) {
-          await page.keyboard.press('Enter');
-        }
-        
-        // iをコードブロック終了行まで進める
+        await pasteChunk(codeBlockLines.join('\n'));
+        if (j < lines.length - 1) await page.keyboard.press('Enter');
         i = j;
-        
-        // フラグをリセット
-        previousLineWasList = false;
-        previousLineWasQuote = false;
-        previousLineWasHorizontalRule = false;
         continue;
       }
-      
-      // 次の行が水平線かどうかをチェック
-      const nextLine = i < lines.length - 1 ? lines[i + 1] : '';
-      const nextLineIsHorizontalRule = nextLine.trim() === '---';
-      
-      // 水平線の直後の空行をスキップ
-      if (previousLineWasHorizontalRule && line.trim() === '') {
-        previousLineWasHorizontalRule = false;
-        continue; // 空行をスキップ
-      }
-      previousLineWasHorizontalRule = false;
-      
-      // 画像マークダウンを検出
+
+      // 画像マークダウン: 個別処理 (2026-04-25 多戦略フォールバック)
       const imageMatch = line.match(/!\[([^\]]*)\]\(([^)]+)\)/);
       if (imageMatch) {
         const imagePath = imageMatch[2];
-        // ローカルパスの画像をアップロード
         if (!imagePath.startsWith('http://') && !imagePath.startsWith('https://')) {
           const imageInfo = images.find(img => img.localPath === imagePath);
           if (imageInfo && fs.existsSync(imageInfo.absolutePath)) {
-            log('Pasting inline image', { path: imageInfo.absolutePath });
-            
-            // 画像をクリップボードにコピーしてペーストする方法
-            // 1. 改行して新しい行を作成
-            await page.keyboard.press('Enter');
-            await page.waitForTimeout(300);
-            
-            // 2. 画像ファイルをクリップボードにコピー
-            const imageBuffer = fs.readFileSync(imageInfo.absolutePath);
-            const base64Image = imageBuffer.toString('base64');
-            const mimeType = imageInfo.absolutePath.endsWith('.png') ? 'image/png' : 
-                           imageInfo.absolutePath.endsWith('.jpg') || imageInfo.absolutePath.endsWith('.jpeg') ? 'image/jpeg' :
-                           imageInfo.absolutePath.endsWith('.gif') ? 'image/gif' : 'image/png';
-            
-            // クリップボードに画像を設定するためのJavaScriptを実行
-            await page.evaluate(async ({ base64, mime }) => {
-              const response = await fetch(`data:${mime};base64,${base64}`);
-              const blob = await response.blob();
-              const item = new ClipboardItem({ [mime]: blob });
-              await navigator.clipboard.write([item]);
-            }, { base64: base64Image, mime: mimeType });
-            
-            await page.waitForTimeout(500);
-            
-            // 3. Cmd+V (macOS) または Ctrl+V でペースト
-            const isMac = process.platform === 'darwin';
-            if (isMac) {
-              await page.keyboard.press('Meta+v');
-            } else {
-              await page.keyboard.press('Control+v');
+            await flushBuffer();
+            const result = await insertInlineImage({
+              page,
+              bodyBox,
+              imagePath: imageInfo.absolutePath,
+              imageIndex: images.indexOf(imageInfo) + 1,
+              totalImages: images.length,
+              screenshotDir,
+              isMac,
+              pasteKey,
+            });
+            log('insertInlineImage result', result);
+            if (!result.success) {
+              // テキスト fallback
+              await pasteChunk(`[image: ${path.basename(imageInfo.absolutePath)}]`);
             }
-            
-            // ペースト完了を待つ
-            await page.waitForTimeout(2000);
-            
-            log('Inline image pasted');
-            
-            // 画像の後に改行してテキストボックスに戻る
-            if (!isLastLine) {
-              await page.keyboard.press('Enter');
-            }
-            previousLineWasList = false; // 画像の後はリストではない
-            previousLineWasQuote = false; // 画像の後は引用ではない
-            previousLineWasHorizontalRule = false; // 画像の後は水平線ではない
-            continue; // 次の行へ
+            if (!isLastLine) await page.keyboard.press('Enter');
+            continue;
           }
         }
       }
-      
-      // 水平線かどうかをチェック
-      const isHorizontalRule = line.trim() === '---';
-      
-      // 現在の行がリスト項目かどうかをチェック
-      const isBulletList = /^(\s*)- /.test(line);
-      const isNumberedList = /^(\s*)\d+\.\s/.test(line);
-      const isCurrentLineList = isBulletList || isNumberedList;
-      
-      // 現在の行が引用かどうかをチェック
-      const isQuote = /^>/.test(line);
-      
-      // 通常のテキスト行を入力
-      let processedLine = line;
-      
-      // 前の行がリスト項目で、現在の行もリスト項目なら、マークダウン記号を削除
-      if (previousLineWasList && isCurrentLineList) {
-        // 箇条書きリスト: "- " または "  - " などを削除
-        // 先頭のスペース（インデント）を保持しつつ、"- " だけを削除
-        if (isBulletList) {
-          processedLine = processedLine.replace(/^(\s*)- /, '$1');
-        }
-        
-        // 番号付きリスト: "1. " または "  1. " などを削除
-        // 先頭のスペース（インデント）を保持しつつ、"数字. " だけを削除
-        if (isNumberedList) {
-          processedLine = processedLine.replace(/^(\s*)\d+\.\s/, '$1');
-        }
-      }
-      
-      // 前の行が引用で、現在の行も引用なら、マークダウン記号を削除
-      if (previousLineWasQuote && isQuote) {
-        // 引用: "> " を削除
-        processedLine = processedLine.replace(/^>\s?/, '');
-      }
-      
-      await page.keyboard.type(processedLine);
-      
-      // 次の行のために、現在の行の状態を記録
-      previousLineWasList = isCurrentLineList;
-      previousLineWasQuote = isQuote;
-      previousLineWasHorizontalRule = isHorizontalRule;
-      
-      // URL単独行の場合、追加でEnterを押してリンクカード化をトリガー
+
+      // URL単独行: フラッシュしてからURLを入力→リンクカード化
       const isUrlLine = /^https?:\/\/[^\s]+$/.test(line.trim());
       if (isUrlLine) {
+        await flushBuffer();
+        await page.keyboard.type(line);
         await page.keyboard.press('Enter');
-        // リンクカード展開のアニメーション完了を待機
         await page.waitForTimeout(1200);
-
-        // 次の行がある場合、キャレットがカード内に残らないよう、確実に次段落へ移動
         if (!isLastLine) {
           await page.keyboard.press('ArrowDown');
           await page.waitForTimeout(150);
         }
-      } else {
-        // URL以外の行の場合のみ、最後の行でなければ改行
+        continue;
+      }
+
+      // 通常行: バッファに追加
+      buffer.push(line);
+
+      // CHUNK_SIZE行ごとにフラッシュ（最後の行も含む）
+      if (buffer.length >= CHUNK_SIZE || isLastLine) {
+        await flushBuffer();
+        // チャンク間で少し待機（エディタの処理時間）
         if (!isLastLine) {
-          await page.keyboard.press('Enter');
+          await page.waitForTimeout(300);
         }
       }
     }
-    
-    log('Body set');
+
+    // 残りのバッファをフラッシュ
+    await flushBuffer();
+
+    // 画像挿入結果の検証ログ (2026-04-25)
+    const totalImagesInDOM = await countImages(bodyBox);
+    log('Body set', { totalImagesInDOM, expectedImages: images.length });
+    if (images.length > 0 && totalImagesInDOM < images.length) {
+      log('WARNING: image count mismatch', {
+        expected: images.length,
+        actual: totalImagesInDOM,
+        missing: images.length - totalImagesInDOM,
+      });
+      await debugSnapshot(page, screenshotDir, 'final-mismatch');
+    }
 
     // 下書き保存の場合
     if (!isPublic) {
@@ -520,6 +1027,10 @@ async function postToNote(params: {
         url: finalUrl,
         screenshot: screenshotPath,
         message: '下書きを保存しました',
+        imageStats: {
+          expected: images.length,
+          actual: totalImagesInDOM,
+        },
       };
     }
 
@@ -582,6 +1093,10 @@ async function postToNote(params: {
       url: finalUrl,
       screenshot: screenshotPath,
       message: '記事を公開しました',
+      imageStats: {
+        expected: images.length,
+        actual: totalImagesInDOM,
+      },
     };
   } catch (error) {
     await browser.close();
@@ -598,6 +1113,20 @@ const PublishNoteSchema = z.object({
   timeout: z.number().optional().describe(`タイムアウト（ミリ秒、デフォルト: ${DEFAULT_TIMEOUT}）`),
 });
 
+const GetAnalyticsSchema = z.object({
+  state_path: z.string().optional().describe(`note.comの認証状態ファイルのパス（デフォルト: ${DEFAULT_STATE_PATH}）`),
+  filter: z.enum(['all', 'monthly', 'weekly', 'yearly']).optional().describe('期間フィルタ（デフォルト: monthly）'),
+  sort: z.enum(['pv', 'like', 'comment']).optional().describe('ソート順（デフォルト: pv）'),
+  limit: z.number().optional().describe('取得する記事数の上限（デフォルト: 10）'),
+  timeout: z.number().optional().describe(`タイムアウト（ミリ秒、デフォルト: ${DEFAULT_TIMEOUT}）`),
+});
+
+const AnalyzeCompetitorSchema = z.object({
+  creator: z.string().describe('note.comのクリエイター名（URLの https://note.com/{creator} 部分）'),
+  limit: z.number().optional().describe('取得する記事数の上限（デフォルト: 20）'),
+  timeout: z.number().optional().describe('タイムアウト（ミリ秒、デフォルト: 30000）'),
+});
+
 const SaveDraftSchema = z.object({
   markdown_path: z.string().describe('Markdownファイルのパス（タイトル、本文、タグを含む）'),
   thumbnail_path: z.string().optional().describe('サムネイル画像のパス（オプション）'),
@@ -608,6 +1137,37 @@ const SaveDraftSchema = z.object({
 
 // ツール定義
 const TOOLS: Tool[] = [
+  {
+    name: 'get_analytics',
+    description: 'note.comのアクセス解析データを取得します。記事別PV・スキ数・コメント数を期間指定で取得できます。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        state_path: {
+          type: 'string',
+          description: `note.comの認証状態ファイルのパス（デフォルト: ${DEFAULT_STATE_PATH}）`,
+        },
+        filter: {
+          type: 'string',
+          enum: ['all', 'monthly', 'weekly', 'yearly'],
+          description: '期間フィルタ: all=全期間, monthly=月間, weekly=週間, yearly=年間（デフォルト: monthly）',
+        },
+        sort: {
+          type: 'string',
+          enum: ['pv', 'like', 'comment'],
+          description: 'ソート順（デフォルト: pv）',
+        },
+        limit: {
+          type: 'number',
+          description: '取得する記事数の上限（デフォルト: 10）',
+        },
+        timeout: {
+          type: 'number',
+          description: `タイムアウト（ミリ秒、デフォルト: ${DEFAULT_TIMEOUT}）`,
+        },
+      },
+    },
+  },
   {
     name: 'publish_note',
     description: 'note.comに記事を公開します。Markdownファイルからタイトル、本文、タグを読み取り、自動的に投稿します。',
@@ -636,6 +1196,28 @@ const TOOLS: Tool[] = [
         },
       },
       required: ['markdown_path'],
+    },
+  },
+  {
+    name: 'analyze_competitor',
+    description: '競合のnote.comクリエイターの記事一覧を取得・分析します。記事タイトル、スキ数、コメント数、ハッシュタグ、公開日を取得し、トップハッシュタグや平均エンゲージメントを算出します。認証不要（公開API使用）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        creator: {
+          type: 'string',
+          description: 'note.comのクリエイター名（URLの https://note.com/{creator} 部分）',
+        },
+        limit: {
+          type: 'number',
+          description: '取得する記事数の上限（デフォルト: 20）',
+        },
+        timeout: {
+          type: 'number',
+          description: 'タイムアウト（ミリ秒、デフォルト: 30000）',
+        },
+      },
+      required: ['creator'],
     },
   },
   {
@@ -693,6 +1275,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
+    if (name === 'get_analytics') {
+      const params = GetAnalyticsSchema.parse(args);
+      const result = await getAnalytics({
+        statePath: params.state_path,
+        filter: params.filter,
+        sort: params.sort,
+        limit: params.limit,
+        timeout: params.timeout,
+      });
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    }
+
+    if (name === 'analyze_competitor') {
+      const params = AnalyzeCompetitorSchema.parse(args);
+      const result = await analyzeCompetitor({
+        creator: params.creator,
+        limit: params.limit,
+        timeout: params.timeout,
+      });
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    }
+
     if (name === 'publish_note') {
       const params = PublishNoteSchema.parse(args);
       const result = await postToNote({
