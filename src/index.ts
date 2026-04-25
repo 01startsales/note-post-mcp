@@ -49,6 +49,7 @@ interface InsertImageContext {
   page: Page;
   bodyBox: Locator;
   imagePath: string;
+  imageAlt: string;         // alt 文字列 → figcaption に挿入
   imageIndex: number;       // 1-based, ログ用
   totalImages: number;
   screenshotDir: string;
@@ -322,11 +323,60 @@ async function insertImageViaClipboard(ctx: InsertImageContext): Promise<boolean
   return true;
 }
 
-// メイン: 3 戦略フォールバック
+// 画像挿入後 figcaption に alt text を設定 (note の TipTap/ProseMirror 対応)
+// Locator.click() + keyboard.type で ProseMirror に確実反映
+async function setFigcaption(
+  page: Page,
+  bodyBox: Locator,
+  imageIndex0Based: number,
+  caption: string
+): Promise<boolean> {
+  if (!caption || !caption.trim()) return false;
+  try {
+    // figcaption を nth-of-type で locate (Playwright Locator API でスクロール+クリック)
+    const figcaptionLoc = bodyBox
+      .locator('figure')
+      .nth(imageIndex0Based)
+      .locator('figcaption');
+
+    const exists = await figcaptionLoc.count();
+    if (exists === 0) {
+      log('  setFigcaption: figcaption locator not found', { idx: imageIndex0Based });
+      return false;
+    }
+
+    // scroll + click + focus (Playwright が中央クリック + retry を自動処理)
+    await figcaptionLoc.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+    await figcaptionLoc.click({ timeout: 3000 });
+    await page.waitForTimeout(200);
+
+    // キーボード入力 (ProseMirror の input イベント経由で state 同期)
+    await page.keyboard.type(caption, { delay: 15 });
+    await page.waitForTimeout(300);
+
+    // 確認: figcaption に text が入ったか
+    const captionText = await figcaptionLoc.textContent({ timeout: 1000 }).catch(() => '');
+    log('  caption confirmed:', { idx: imageIndex0Based, expected: caption, actual: captionText?.trim() });
+
+    // 本文末尾に focus を戻す (次の画像挿入のため必須)
+    await bodyBox.click().catch(() => {});
+    await page.keyboard.press('End').catch(() => {});
+    await page.waitForTimeout(100);
+
+    return (captionText?.trim() === caption.trim());
+  } catch (e: any) {
+    log('  setFigcaption error:', e?.message);
+    // エラーでも focus を戻して次の処理に影響しないようにする
+    await bodyBox.click().catch(() => {});
+    return false;
+  }
+}
+
+// メイン: 3 戦略フォールバック + キャプション設定
 async function insertInlineImage(ctx: InsertImageContext): Promise<InsertImageResult> {
-  const { page, bodyBox, imagePath, imageIndex, totalImages, screenshotDir } = ctx;
+  const { page, bodyBox, imagePath, imageAlt, imageIndex, totalImages, screenshotDir } = ctx;
   const tag = `[image ${imageIndex}/${totalImages}]`;
-  log(`${tag} start`, { imagePath });
+  log(`${tag} start`, { imagePath, imageAlt });
 
   await bodyBox.click().catch(() => {});  // focus 確実化
   await page.waitForTimeout(100);
@@ -338,16 +388,19 @@ async function insertInlineImage(ctx: InsertImageContext): Promise<InsertImageRe
   await page.keyboard.press('Enter');
   await page.waitForTimeout(300);
 
+  // 共通成功処理: 検証のみ (figcaption は postToNote の最後に一括設定)
+  const onSuccess = async (strategy: 'inputFiles' | 'drop' | 'clipboard'): Promise<InsertImageResult> => {
+    const after = await countImages(bodyBox);
+    log(`${tag} ✓ ${strategy} success`, { before, after });
+    return { success: true, strategy, imgCountBefore: before, imgCountAfter: after };
+  };
+
   // === 戦略 1: setInputFiles ===
   try {
     const ok = await insertImageViaInputFiles(page, imagePath);
     if (ok) {
       const success = await waitForImageAdded(bodyBox, before, 8000);
-      if (success) {
-        const after = await countImages(bodyBox);
-        log(`${tag} ✓ inputFiles success`, { before, after });
-        return { success: true, strategy: 'inputFiles', imgCountBefore: before, imgCountAfter: after };
-      }
+      if (success) return await onSuccess('inputFiles');
       log(`${tag} ✗ inputFiles: img count did not increase`);
     }
   } catch (e: any) {
@@ -360,11 +413,7 @@ async function insertInlineImage(ctx: InsertImageContext): Promise<InsertImageRe
     const ok = await insertImageViaDrop(bodyBox, imagePath);
     if (ok) {
       const success = await waitForImageAdded(bodyBox, before, 8000);
-      if (success) {
-        const after = await countImages(bodyBox);
-        log(`${tag} ✓ drop success`, { before, after });
-        return { success: true, strategy: 'drop', imgCountBefore: before, imgCountAfter: after };
-      }
+      if (success) return await onSuccess('drop');
       log(`${tag} ✗ drop: img count did not increase`);
     }
   } catch (e: any) {
@@ -377,11 +426,7 @@ async function insertInlineImage(ctx: InsertImageContext): Promise<InsertImageRe
     const ok = await insertImageViaClipboard(ctx);
     if (ok) {
       const success = await waitForImageAdded(bodyBox, before, 8000);
-      if (success) {
-        const after = await countImages(bodyBox);
-        log(`${tag} ✓ clipboard success`, { before, after });
-        return { success: true, strategy: 'clipboard', imgCountBefore: before, imgCountAfter: after };
-      }
+      if (success) return await onSuccess('clipboard');
       log(`${tag} ✗ clipboard: img count did not increase`);
     }
   } catch (e: any) {
@@ -946,6 +991,7 @@ async function postToNote(params: {
               page,
               bodyBox,
               imagePath: imageInfo.absolutePath,
+              imageAlt: imageInfo.alt || '',  // figcaption に挿入
               imageIndex: images.indexOf(imageInfo) + 1,
               totalImages: images.length,
               screenshotDir,
@@ -1003,6 +1049,19 @@ async function postToNote(params: {
         missing: images.length - totalImagesInDOM,
       });
       await debugSnapshot(page, screenshotDir, 'final-mismatch');
+    }
+
+    // 一括 figcaption 設定 (本文ループ後、画像挿入を妨げないため最後に実施)
+    if (totalImagesInDOM > 0) {
+      let captionsSet = 0;
+      for (let i = 0; i < Math.min(totalImagesInDOM, images.length); i++) {
+        const alt = images[i]?.alt || '';
+        if (alt && alt.trim() && alt !== 'image') {
+          const ok = await setFigcaption(page, bodyBox, i, alt);
+          if (ok) captionsSet++;
+        }
+      }
+      log('Captions set', { total: totalImagesInDOM, applied: captionsSet });
     }
 
     // 下書き保存の場合
